@@ -1,0 +1,12 @@
+.venv/
+venv/
+.env
+.env.save
+**/.env
+__pycache__/
+*.pyc
+.DS_Store
+logs/
+reports_test/
+**/logs/
+**/reports_test/
