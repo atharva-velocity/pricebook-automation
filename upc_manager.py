@@ -22,9 +22,9 @@ PRICEBOOKS_FOLDER = "pricebooks"
 UPLOAD_FOLDER = "uploaded_pricebooks"
 
 # Remote Server Configuration
-REMOTE_USER = "your_username"
-REMOTE_HOST = "your.server.com"
-REMOTE_DIR = "/path/to/remote/directory"
+REMOTE_USER = "ruksharPrd"                    # SSH username
+REMOTE_HOST = "10.78.118.5"                  # Server hostname/IP
+REMOTE_DIR = "/var/sftp/pricebook_automation"    
 
 # Category Matching Configuration
 CONFIDENCE_THRESHOLD = 70
