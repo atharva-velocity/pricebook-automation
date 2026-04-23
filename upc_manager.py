@@ -60,11 +60,18 @@ def get_available_pricebooks():
     pricebooks = []
     for file in os.listdir(PRICEBOOKS_FOLDER):
         if file.endswith('.csv'):
+            file_path = os.path.join(PRICEBOOKS_FOLDER, file)
             client_name = file[:-4].replace('_', ' ').title()
+            
+            # Get last modified time
+            modified_time = os.path.getmtime(file_path)
+            last_updated = datetime.fromtimestamp(modified_time)
+            
             pricebooks.append({
                 'name': client_name,
                 'filename': file,
-                'path': os.path.join(PRICEBOOKS_FOLDER, file)
+                'path': file_path,
+                'last_updated': last_updated
             })
     
     return sorted(pricebooks, key=lambda x: x['name'])
@@ -371,8 +378,17 @@ def render_client_selector():
         if st.button("📂 Load Pricebook", type="primary"):
             load_selected_pricebook(pricebooks, selected_client)
     
+    # Show currently loaded info with last updated time
     if st.session_state.csv_data is not None and st.session_state.selected_client:
-        st.info(f"📋 Currently loaded: **{st.session_state.selected_client}** ({len(st.session_state.csv_data)} records)")
+        # Find the selected pricebook to get last updated time
+        selected_pb = next((pb for pb in pricebooks if pb['name'] == st.session_state.selected_client), None)
+        
+        if selected_pb:
+            last_updated_str = selected_pb['last_updated'].strftime("%B %d, %Y at %I:%M %p")
+            st.info(f"📋 Currently loaded: **{st.session_state.selected_client}** ({len(st.session_state.csv_data)} records) | 🕒 Last updated: {last_updated_str}")
+        else:
+            # Fallback for manual uploads
+            st.info(f"📋 Currently loaded: **{st.session_state.selected_client}** ({len(st.session_state.csv_data)} records)")
 
 def render_no_pricebooks_found():
     """Render fallback UI when no pricebooks are found"""
