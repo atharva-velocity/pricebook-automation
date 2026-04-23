@@ -11,6 +11,8 @@ import subprocess
 from io import StringIO
 from datetime import datetime
 from difflib import SequenceMatcher
+from PIL import Image          # ← ADD THIS
+import pytesseract   
 
 # ============================================================================
 # CONFIGURATION
@@ -237,7 +239,19 @@ def create_entry(upc, product_name, category_code, category_name, confidence=100
 # ============================================================================
 # PARSING FUNCTIONS
 # ============================================================================
-
+def extract_text_from_image(image_file):
+    """Extract text from uploaded image using OCR"""
+    try:
+        # Open image
+        image = Image.open(image_file)
+        
+        # Extract text using pytesseract
+        text = pytesseract.image_to_string(image)
+        
+        return text
+    except Exception as e:
+        raise Exception(f"OCR failed: {str(e)}")
+    
 def parse_excel_file(file, csv_df):
     """Parse Excel file and extract UPC entries"""
     df = pd.read_excel(file)
@@ -312,43 +326,54 @@ def should_skip_line(line, idx):
         return True
     return False
 
-def parse_table_line(line, csv_df):
-    """Parse tab/pipe separated table format"""
-    parts = [p.strip() for p in re.split(r'[\t|]+', line) if p.strip()]
+def extract_upc_and_product(line):
+    """
+    Smart extraction: finds UPC and product name regardless of format
+    Handles: UPC;PRODUCT, PRODUCT;UPC, UPC PRODUCT, PRODUCT UPC, etc.
+    """
+    # Find all 10-14 digit numbers (potential UPCs)
+    upc_matches = re.findall(r'\b\d{10,14}\b', line)
     
-    if len(parts) < 2:
-        return None
+    if not upc_matches:
+        return None, None
     
-    for i, part in enumerate(parts):
-        if re.match(r'^\d{10,14}$', part):
-            upc = part.lstrip('0')
-            
-            for j in range(i + 1, len(parts)):
-                if not re.match(r'^\d+$', parts[j]) and len(parts[j]) > 2:
-                    product_name = parts[j]
-                    category_code, category_name, confidence = find_category_by_product(product_name, csv_df)
-                    return create_entry(upc, product_name, category_code, category_name, confidence)
+    # Take the first UPC found, remove leading zeros
+    upc = upc_matches[0].lstrip('0')
     
-    return None
-
-def parse_simple_line(line, csv_df):
-    """Parse simple format: UPC followed by product name"""
-    match = re.match(r'(\d{10,14})\s+(.+)', line)
+    # Remove the UPC from line to get product name
+    product_name = re.sub(r'\b\d{10,14}\b', '', line)
     
-    if not match:
-        return None
+    # Clean up product name - remove separators and extra whitespace
+    product_name = re.sub(r'[;|,\t]+', ' ', product_name)
+    product_name = product_name.strip()
     
-    upc = match.group(1).lstrip('0')
-    product_name = match.group(2).strip()
-    
+    # Remove promotional codes at the end
     product_name = re.sub(r'\s+\w+_\w+\d{4}\s*$', '', product_name)
     product_name = product_name.strip()
     
-    if product_name and len(product_name) > 2:
-        category_code, category_name, confidence = find_category_by_product(product_name, csv_df)
-        return create_entry(upc, product_name, category_code, category_name, confidence)
+    if len(product_name) > 2:
+        return upc, product_name
     
-    return None
+    return None, None
+
+def parse_text_input(text, csv_df):
+    """Parse text/copied PDF/OCR content and extract UPC entries"""
+    lines = [line.strip() for line in text.split('\n') if line.strip()]
+    entries = []
+    
+    for idx, line in enumerate(lines):
+        # Skip instruction/header lines
+        if should_skip_line(line, idx):
+            continue
+        
+        # Extract UPC and product name (handles any format)
+        upc, product_name = extract_upc_and_product(line)
+        
+        if upc and product_name:
+            category_code, category_name, confidence = find_category_by_product(product_name, csv_df)
+            entries.append(create_entry(upc, product_name, category_code, category_name, confidence))
+    
+    return entries
 
 # ============================================================================
 # UI COMPONENTS
@@ -417,10 +442,10 @@ def load_selected_pricebook(pricebooks, selected_client):
         st.rerun()
 
 def render_data_input():
-    """Render Step 2: Excel/Text input"""
+    """Render Step 2: Excel/Text/Image input"""
     st.header("Step 2: Add Client Request")
     
-    col1, col2 = st.columns(2)
+    col1, col2 = st.columns([1, 1])
     
     with col1:
         render_excel_upload()
@@ -439,12 +464,35 @@ def render_excel_upload():
         st.success(f"Found {len(entries)} entries")
 
 def render_text_input():
-    """Render text paste section"""
-    st.subheader("📝 Or Paste Text/PDF")
-    st.info("💡 For PDFs: Select table → Copy → Paste here")
+    """Render text paste and image upload section"""
+    st.subheader("📝 Paste Text/PDF or Upload Image")
+    st.info("💡 For PDFs: Select table → Copy → Paste below | For Images: Upload screenshot/photo")
     
+    # Add image upload option
+    image_file = st.file_uploader("Or upload image (PNG, JPG)", type=['png', 'jpg', 'jpeg'], key='image')
+    
+    if image_file and st.button("Extract Text from Image"):
+        try:
+            extracted_text = extract_text_from_image(image_file)
+            st.success("✓ Text extracted from image!")
+            
+            # Show extracted text for review
+            with st.expander("📄 Extracted Text (click to review)"):
+                st.text_area("Extracted content:", value=extracted_text, height=150, disabled=True)
+            
+            # Parse the extracted text
+            entries = parse_text_input(extracted_text, st.session_state.csv_data)
+            st.session_state.parsed_entries = entries
+            if entries:
+                st.success(f"Found {len(entries)} entries from image")
+            else:
+                st.error("No UPCs found in extracted text")
+        except Exception as e:
+            st.error(f"❌ Image processing failed: {str(e)}")
+    
+    # Keep existing text area
     text_input = st.text_area(
-        "Paste client text/email/copied PDF:",
+        "Or paste client text/email/copied PDF:",
         height=200,
         placeholder="Example:\n03202092872 Cookie Monster 2oz\n\nOr paste table from PDF..."
     )
@@ -457,6 +505,7 @@ def render_text_input():
         else:
             st.error("No UPCs found in text")
 
+            
 def render_review_section():
     """Render Step 3: Review and edit parsed entries"""
     st.header("Step 3: Review & Edit Entries")
