@@ -13,6 +13,15 @@ from datetime import datetime
 from difflib import SequenceMatcher
 from PIL import Image          # ← ADD THIS
 import pytesseract   
+import json
+
+# Load NACS mapping at startup
+NACS_CATEGORIES = {}
+try:
+    with open('nacs_categories.json', 'r') as f:
+        NACS_CATEGORIES = json.load(f)
+except FileNotFoundError:
+    st.warning("⚠️ NACS mapping not found. Run setup_nacs.py first.")
 
 # ============================================================================
 # CONFIGURATION
@@ -150,8 +159,9 @@ def calculate_similarity(str1, str2):
     
     return round(final_score, 1)
 
-def find_category_by_product(product_name, csv_df):
-    """Search CSV for similar products and extract category info with confidence"""
+
+def match_against_csv(product_name, csv_df):
+    """Match product against existing CSV products"""
     if not product_name or csv_df is None:
         return '', '', 0
     
@@ -168,12 +178,10 @@ def find_category_by_product(product_name, csv_df):
             continue
         
         existing_product = str(row['Product Name']).upper()
-        
         matched_keywords = sum(1 for kw in keywords if kw in existing_product)
         
         if matched_keywords > 0:
             keyword_ratio = (matched_keywords / len(keywords)) * 100
-            
             matches.append({
                 'category_code': row['Category Code'],
                 'category_name': row['Category Name'],
@@ -184,7 +192,6 @@ def find_category_by_product(product_name, csv_df):
     if matches:
         matches.sort(key=lambda x: x['score'], reverse=True)
         best_match = matches[0]
-        
         if best_match['score'] >= 50:
             return best_match['category_code'], best_match['category_name'], best_match['score']
     
@@ -195,7 +202,6 @@ def find_category_by_product(product_name, csv_df):
             continue
         
         existing_product = str(row['Product Name']).upper()
-        
         similarity = calculate_similarity(product_upper, existing_product)
         
         if similarity >= 60:
@@ -213,6 +219,36 @@ def find_category_by_product(product_name, csv_df):
     
     return '', '', 0
 
+def find_category_by_product(product_name, csv_df):
+    """
+    Dual-source matching: CSV first (client truth), NACS second (helper)
+    Returns: (code, name, confidence, source)
+    """
+    if not product_name:
+        return '', '', 0, 'None'
+    
+    # Try CSV matching
+    csv_code, csv_name, csv_conf = match_against_csv(product_name, csv_df)
+    
+    # Try NACS matching
+    nacs_code, nacs_name, nacs_conf = match_against_nacs(product_name)
+    
+    # Decision: CSV first, NACS second
+    if csv_conf >= 70:
+        return csv_code, csv_name, csv_conf, 'CSV'
+    
+    if nacs_conf >= 70:
+        return nacs_code, nacs_name, nacs_conf, 'NACS'
+    
+    # Both low confidence - pick higher
+    if csv_conf >= nacs_conf and csv_conf > 0:
+        return csv_code, csv_name, csv_conf, 'CSV'
+    elif nacs_conf > 0:
+        return nacs_code, nacs_name, nacs_conf, 'NACS'
+    
+    return '', '', 0, 'None'
+
+
 def check_duplicates(entries, csv_df):
     """Check which UPCs already exist in the CSV"""
     if csv_df is None:
@@ -221,8 +257,8 @@ def check_duplicates(entries, csv_df):
     return [entry['UPC/ PLU'] for entry in entries 
             if entry['UPC/ PLU'] in csv_df['UPC/ PLU'].values]
 
-def create_entry(upc, product_name, category_code, category_name, confidence=100):
-    """Create a standardized entry dictionary with confidence score"""
+def create_entry(upc, product_name, category_code, category_name, confidence=100, source='Manual'):
+    """Create entry with source tracking"""
     return {
         'Category Code': category_code,
         'Category Name': category_name,
@@ -233,9 +269,9 @@ def create_entry(upc, product_name, category_code, category_name, confidence=100
         'Check Digit': '',
         'Vendor ID': '',
         'Vendor Description': '',
-        'Confidence': confidence
+        'Confidence': confidence,
+        'Source': source  # Track where category came from
     }
-
 # ============================================================================
 # PARSING FUNCTIONS
 # ============================================================================
@@ -262,21 +298,16 @@ def parse_excel_file(file, csv_df):
     product_col = next((col for col in df.columns if any(x in col.lower() for x in ['product', 'name', 'description'])), None)
     
     for _, row in df.iterrows():
-        # Handle dept/category code conversion
         category_code = ''
         if dept_col and pd.notna(row[dept_col]):
             dept_value = str(row[dept_col])
             try:
-                # Convert to float to check if it's a whole number
                 num = float(dept_value)
-                # If whole number (24.0, 1500.0), just use integer part
                 if num == int(num):
                     category_code = str(int(num))
                 else:
-                    # If has meaningful decimals (7.07, 2.4), remove dot
                     category_code = dept_value.replace('.', '')
             except:
-                # If conversion fails, just remove dots as fallback
                 category_code = dept_value.replace('.', '')
         
         upc = str(row[upc_col]).strip() if upc_col and pd.notna(row[upc_col]) else ''
@@ -284,16 +315,17 @@ def parse_excel_file(file, csv_df):
         
         if upc and category_code:
             category_name = ''
-            confidence = 100
-            
             if csv_df is not None:
                 matches = csv_df[csv_df['Category Code'] == category_code]
                 if not matches.empty:
                     category_name = matches.iloc[0]['Category Name']
             
-            entries.append(create_entry(upc, product_name, category_code, category_name, confidence))
+            # Excel provides category, so source is 'Excel' with 100% confidence
+            entries.append(create_entry(upc, product_name, category_code, category_name, 100, 'Excel'))
     
     return entries
+
+
 
 def parse_text_input(text, csv_df):
     """Parse text/copied PDF content and extract UPC entries"""
@@ -362,19 +394,17 @@ def parse_text_input(text, csv_df):
     entries = []
     
     for idx, line in enumerate(lines):
-        # Skip instruction/header lines
         if should_skip_line(line, idx):
             continue
         
-        # Extract UPC and product name (handles any format)
         upc, product_name = extract_upc_and_product(line)
         
         if upc and product_name:
-            category_code, category_name, confidence = find_category_by_product(product_name, csv_df)
-            entries.append(create_entry(upc, product_name, category_code, category_name, confidence))
+            # Now returns 4 values: code, name, confidence, source
+            code, name, conf, source = find_category_by_product(product_name, csv_df)
+            entries.append(create_entry(upc, product_name, code, name, conf, source))
     
     return entries
-
 # ============================================================================
 # UI COMPONENTS
 # ============================================================================
@@ -615,22 +645,18 @@ def add_entries_to_csv(duplicates):
             st.error("All entries are duplicates!")
             return
         
-        # Remove confidence field before adding to CSV
         cleaned_entries = []
         for entry in new_entries:
             entry_copy = entry.copy()
-            entry_copy.pop('Confidence', None)
+            entry_copy.pop('Confidence', None)  # Remove tracking field
+            entry_copy.pop('Source', None)      # Remove tracking field
             cleaned_entries.append(entry_copy)
         
-        # Convert to DataFrame
         new_df = pd.DataFrame(cleaned_entries)
         
-        # Ensure columns match
         if st.session_state.csv_data is not None:
-            # Reorder columns to match existing CSV
             new_df = new_df[st.session_state.csv_data.columns]
         
-        # Concatenate
         st.session_state.csv_data = pd.concat([st.session_state.csv_data, new_df], ignore_index=True)
         st.session_state.added_entries = cleaned_entries
         st.session_state.parsed_entries = []
@@ -682,6 +708,31 @@ def render_download_section():
     with col2:
         if st.button("📤 Upload to Server", type="secondary"):
             upload_to_server()
+
+def match_against_nacs(product_name):
+    """Match product against NACS keywords"""
+    if not product_name or not NACS_CATEGORIES:
+        return '', '', 0
+    
+    product_upper = product_name.upper()
+    best_match = None
+    best_score = 0
+    
+    for code, info in NACS_CATEGORIES.items():
+        matched_keywords = sum(1 for kw in info['keywords'] if kw.upper() in product_upper)
+        
+        if matched_keywords > 0:
+            score = (matched_keywords / len(info['keywords'])) * 100
+            
+            if score > best_score:
+                best_score = score
+                best_match = (code, info['name'], round(score, 1))
+    
+    if best_match and best_score >= 30:  # Minimum threshold
+        return best_match
+    
+    return '', '', 0
+
 
 def generate_filename(client_name):
     """Generate appropriate filename for download"""
