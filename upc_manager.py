@@ -607,25 +607,41 @@ def render_entry_editors(display_entries, duplicates):
 
 def add_entries_to_csv(duplicates):
     """Add non-duplicate entries to CSV data"""
-    new_entries = [e for e in st.session_state.parsed_entries if e['UPC/ PLU'] not in duplicates]
-    skipped = len(st.session_state.parsed_entries) - len(new_entries)
-    
-    if new_entries:
+    try:
+        new_entries = [e for e in st.session_state.parsed_entries if e['UPC/ PLU'] not in duplicates]
+        skipped = len(st.session_state.parsed_entries) - len(new_entries)
+        
+        if not new_entries:
+            st.error("All entries are duplicates!")
+            return
+        
+        # Remove confidence field before adding to CSV
         cleaned_entries = []
         for entry in new_entries:
             entry_copy = entry.copy()
             entry_copy.pop('Confidence', None)
             cleaned_entries.append(entry_copy)
         
+        # Convert to DataFrame
         new_df = pd.DataFrame(cleaned_entries)
+        
+        # Ensure columns match
+        if st.session_state.csv_data is not None:
+            # Reorder columns to match existing CSV
+            new_df = new_df[st.session_state.csv_data.columns]
+        
+        # Concatenate
         st.session_state.csv_data = pd.concat([st.session_state.csv_data, new_df], ignore_index=True)
         st.session_state.added_entries = cleaned_entries
         st.session_state.parsed_entries = []
         
         st.success(f"✓ Added {len(new_entries)} entries{f', skipped {skipped} duplicates' if skipped > 0 else ''}")
         st.rerun()
-    else:
-        st.error("All entries are duplicates!")
+        
+    except Exception as e:
+        st.error(f"❌ Error adding entries: {str(e)}")
+        import traceback
+        st.code(traceback.format_exc())
 
 def render_recently_added():
     """Show recently added entries"""
