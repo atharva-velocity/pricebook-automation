@@ -7,6 +7,7 @@ import streamlit as st
 import pandas as pd
 import os
 from io import StringIO
+from difflib import SequenceMatcher
 
 st.set_page_config(page_title="Search Pricebook", page_icon="🔍", layout="wide")
 
@@ -59,21 +60,53 @@ def load_csv_from_path(file_path):
     return pd.DataFrame(data, columns=headers)
 
 def search_pricebook(df, search_term):
-    """Search across all fields in pricebook"""
+    """Search with fuzzy matching - handles typos and partial matches"""
     if not search_term or df is None:
         return df
     
-    search_lower = search_term.lower()
+    search_lower = search_term.lower().strip()
+    results = []
     
-    # Search in all text columns
-    mask = (
-        df['UPC/ PLU'].str.lower().str.contains(search_lower, na=False) |
-        df['Product Name'].str.lower().str.contains(search_lower, na=False) |
-        df['Category Code'].str.lower().str.contains(search_lower, na=False) |
-        df['Category Name'].str.lower().str.contains(search_lower, na=False)
-    )
+    for idx, row in df.iterrows():
+        # Combine searchable fields
+        upc_text = str(row['UPC/ PLU']).lower()
+        product_text = str(row['Product Name']).lower()
+        cat_code = str(row['Category Code']).lower()
+        cat_name = str(row['Category Name']).lower()
+        
+        # Exact or partial match in UPC/Category Code (no fuzzy needed)
+        if search_lower in upc_text or search_lower in cat_code:
+            results.append(idx)
+            continue
+        
+        # Fuzzy match in Product Name (handles typos)
+        product_similarity = SequenceMatcher(None, search_lower, product_text).ratio()
+        
+        # Also check if search term appears as substring with minor differences
+        # Split into words and check each
+        search_words = search_lower.split()
+        product_words = product_text.split()
+        
+        word_matches = 0
+        for search_word in search_words:
+            for product_word in product_words:
+                # Check similarity between individual words
+                word_similarity = SequenceMatcher(None, search_word, product_word).ratio()
+                if word_similarity >= 0.8:  # 80% similar
+                    word_matches += 1
+                    break
+        
+        # Match if enough words are similar OR overall similarity is high
+        if word_matches >= len(search_words) * 0.7 or product_similarity >= 0.6:
+            results.append(idx)
+            continue
+        
+        # Fuzzy match in Category Name
+        cat_similarity = SequenceMatcher(None, search_lower, cat_name).ratio()
+        if cat_similarity >= 0.7:
+            results.append(idx)
     
-    return df[mask]
+    return df.loc[results] if results else pd.DataFrame(columns=df.columns)
 
 # ============================================================================
 # UI
