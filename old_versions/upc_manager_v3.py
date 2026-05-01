@@ -11,17 +11,6 @@ import subprocess
 from io import StringIO
 from datetime import datetime
 from difflib import SequenceMatcher
-from PIL import Image          # ← ADD THIS
-import pytesseract   
-import json
-
-# Load NACS mapping at startup
-NACS_CATEGORIES = {}
-try:
-    with open('nacs_categories.json', 'r') as f:
-        NACS_CATEGORIES = json.load(f)
-except FileNotFoundError:
-    st.warning("⚠️ NACS mapping not found. Run setup_nacs.py first.")
 
 # ============================================================================
 # CONFIGURATION
@@ -32,7 +21,6 @@ st.set_page_config(page_title="UPC Pricebook Manager", page_icon="📊", layout=
 PRICEBOOKS_FOLDER = "pricebooks"
 UPLOAD_FOLDER = "uploaded_pricebooks"
 
-# Remote Server Configuration
 REMOTE_USER = "ruksharPrd"                    # SSH username
 REMOTE_HOST = "10.78.118.5"                  # Server hostname/IP
 REMOTE_DIR = "/var/sftp/pricebook_automation"    
@@ -71,18 +59,11 @@ def get_available_pricebooks():
     pricebooks = []
     for file in os.listdir(PRICEBOOKS_FOLDER):
         if file.endswith('.csv'):
-            file_path = os.path.join(PRICEBOOKS_FOLDER, file)
             client_name = file[:-4].replace('_', ' ').title()
-            
-            # Get last modified time
-            modified_time = os.path.getmtime(file_path)
-            last_updated = datetime.fromtimestamp(modified_time)
-            
             pricebooks.append({
                 'name': client_name,
                 'filename': file,
-                'path': file_path,
-                'last_updated': last_updated
+                'path': os.path.join(PRICEBOOKS_FOLDER, file)
             })
     
     return sorted(pricebooks, key=lambda x: x['name'])
@@ -159,9 +140,8 @@ def calculate_similarity(str1, str2):
     
     return round(final_score, 1)
 
-
-def match_against_csv(product_name, csv_df):
-    """Match product against existing CSV products"""
+def find_category_by_product(product_name, csv_df):
+    """Search CSV for similar products and extract category info with confidence"""
     if not product_name or csv_df is None:
         return '', '', 0
     
@@ -178,10 +158,12 @@ def match_against_csv(product_name, csv_df):
             continue
         
         existing_product = str(row['Product Name']).upper()
+        
         matched_keywords = sum(1 for kw in keywords if kw in existing_product)
         
         if matched_keywords > 0:
             keyword_ratio = (matched_keywords / len(keywords)) * 100
+            
             matches.append({
                 'category_code': row['Category Code'],
                 'category_name': row['Category Name'],
@@ -192,6 +174,7 @@ def match_against_csv(product_name, csv_df):
     if matches:
         matches.sort(key=lambda x: x['score'], reverse=True)
         best_match = matches[0]
+        
         if best_match['score'] >= 50:
             return best_match['category_code'], best_match['category_name'], best_match['score']
     
@@ -202,6 +185,7 @@ def match_against_csv(product_name, csv_df):
             continue
         
         existing_product = str(row['Product Name']).upper()
+        
         similarity = calculate_similarity(product_upper, existing_product)
         
         if similarity >= 60:
@@ -219,36 +203,6 @@ def match_against_csv(product_name, csv_df):
     
     return '', '', 0
 
-def find_category_by_product(product_name, csv_df):
-    """
-    Dual-source matching: CSV first (client truth), NACS second (helper)
-    Returns: (code, name, confidence, source)
-    """
-    if not product_name:
-        return '', '', 0, 'None'
-    
-    # Try CSV matching
-    csv_code, csv_name, csv_conf = match_against_csv(product_name, csv_df)
-    
-    # Try NACS matching
-    nacs_code, nacs_name, nacs_conf = match_against_nacs(product_name)
-    
-    # Decision: CSV first, NACS second
-    if csv_conf >= 70:
-        return csv_code, csv_name, csv_conf, 'CSV'
-    
-    if nacs_conf >= 70:
-        return nacs_code, nacs_name, nacs_conf, 'NACS'
-    
-    # Both low confidence - pick higher
-    if csv_conf >= nacs_conf and csv_conf > 0:
-        return csv_code, csv_name, csv_conf, 'CSV'
-    elif nacs_conf > 0:
-        return nacs_code, nacs_name, nacs_conf, 'NACS'
-    
-    return '', '', 0, 'None'
-
-
 def check_duplicates(entries, csv_df):
     """Check which UPCs already exist in the CSV"""
     if csv_df is None:
@@ -257,8 +211,8 @@ def check_duplicates(entries, csv_df):
     return [entry['UPC/ PLU'] for entry in entries 
             if entry['UPC/ PLU'] in csv_df['UPC/ PLU'].values]
 
-def create_entry(upc, product_name, category_code, category_name, confidence=100, source='Manual'):
-    """Create entry with source tracking"""
+def create_entry(upc, product_name, category_code, category_name, confidence=100):
+    """Create a standardized entry dictionary with confidence score"""
     return {
         'Category Code': category_code,
         'Category Name': category_name,
@@ -269,25 +223,13 @@ def create_entry(upc, product_name, category_code, category_name, confidence=100
         'Check Digit': '',
         'Vendor ID': '',
         'Vendor Description': '',
-        'Confidence': confidence,
-        'Source': source  # Track where category came from
+        'Confidence': confidence
     }
+
 # ============================================================================
 # PARSING FUNCTIONS
 # ============================================================================
-def extract_text_from_image(image_file):
-    """Extract text from uploaded image using OCR"""
-    try:
-        # Open image
-        image = Image.open(image_file)
-        
-        # Extract text using pytesseract
-        text = pytesseract.image_to_string(image)
-        
-        return text
-    except Exception as e:
-        raise Exception(f"OCR failed: {str(e)}")
-    
+
 def parse_excel_file(file, csv_df):
     """Parse Excel file and extract UPC entries"""
     df = pd.read_excel(file)
@@ -298,34 +240,22 @@ def parse_excel_file(file, csv_df):
     product_col = next((col for col in df.columns if any(x in col.lower() for x in ['product', 'name', 'description'])), None)
     
     for _, row in df.iterrows():
-        category_code = ''
-        if dept_col and pd.notna(row[dept_col]):
-            dept_value = str(row[dept_col])
-            try:
-                num = float(dept_value)
-                if num == int(num):
-                    category_code = str(int(num))
-                else:
-                    category_code = dept_value.replace('.', '')
-            except:
-                category_code = dept_value.replace('.', '')
-        
+        category_code = str(row[dept_col]).replace('.', '') if dept_col and pd.notna(row[dept_col]) else ''
         upc = str(row[upc_col]).strip() if upc_col and pd.notna(row[upc_col]) else ''
         product_name = str(row[product_col]).strip() if product_col and pd.notna(row[product_col]) else 'UNNAMED PRODUCT'
         
         if upc and category_code:
             category_name = ''
+            confidence = 100
+            
             if csv_df is not None:
                 matches = csv_df[csv_df['Category Code'] == category_code]
                 if not matches.empty:
                     category_name = matches.iloc[0]['Category Name']
             
-            # Excel provides category, so source is 'Excel' with 100% confidence
-            entries.append(create_entry(upc, product_name, category_code, category_name, 100, 'Excel'))
+            entries.append(create_entry(upc, product_name, category_code, category_name, confidence))
     
     return entries
-
-
 
 def parse_text_input(text, csv_df):
     """Parse text/copied PDF content and extract UPC entries"""
@@ -358,53 +288,44 @@ def should_skip_line(line, idx):
         return True
     return False
 
-def extract_upc_and_product(line):
-    """
-    Smart extraction: finds UPC and product name regardless of format
-    Handles: UPC;PRODUCT, PRODUCT;UPC, UPC PRODUCT, PRODUCT UPC, etc.
-    """
-    # Find all 10-14 digit numbers (potential UPCs)
-    upc_matches = re.findall(r'\b\d{10,14}\b', line)
+def parse_table_line(line, csv_df):
+    """Parse tab/pipe separated table format"""
+    parts = [p.strip() for p in re.split(r'[\t|]+', line) if p.strip()]
     
-    if not upc_matches:
-        return None, None
+    if len(parts) < 2:
+        return None
     
-    # Take the first UPC found, remove leading zeros
-    upc = upc_matches[0].lstrip('0')
+    for i, part in enumerate(parts):
+        if re.match(r'^\d{10,14}$', part):
+            upc = part.lstrip('0')
+            
+            for j in range(i + 1, len(parts)):
+                if not re.match(r'^\d+$', parts[j]) and len(parts[j]) > 2:
+                    product_name = parts[j]
+                    category_code, category_name, confidence = find_category_by_product(product_name, csv_df)
+                    return create_entry(upc, product_name, category_code, category_name, confidence)
     
-    # Remove the UPC from line to get product name
-    product_name = re.sub(r'\b\d{10,14}\b', '', line)
+    return None
+
+def parse_simple_line(line, csv_df):
+    """Parse simple format: UPC followed by product name"""
+    match = re.match(r'(\d{10,14})\s+(.+)', line)
     
-    # Clean up product name - remove separators and extra whitespace
-    product_name = re.sub(r'[;|,\t]+', ' ', product_name)
-    product_name = product_name.strip()
+    if not match:
+        return None
     
-    # Remove promotional codes at the end
+    upc = match.group(1).lstrip('0')
+    product_name = match.group(2).strip()
+    
     product_name = re.sub(r'\s+\w+_\w+\d{4}\s*$', '', product_name)
     product_name = product_name.strip()
     
-    if len(product_name) > 2:
-        return upc, product_name
+    if product_name and len(product_name) > 2:
+        category_code, category_name, confidence = find_category_by_product(product_name, csv_df)
+        return create_entry(upc, product_name, category_code, category_name, confidence)
     
-    return None, None
+    return None
 
-def parse_text_input(text, csv_df):
-    """Parse text/copied PDF/OCR content and extract UPC entries"""
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    entries = []
-    
-    for idx, line in enumerate(lines):
-        if should_skip_line(line, idx):
-            continue
-        
-        upc, product_name = extract_upc_and_product(line)
-        
-        if upc and product_name:
-            # Now returns 4 values: code, name, confidence, source
-            code, name, conf, source = find_category_by_product(product_name, csv_df)
-            entries.append(create_entry(upc, product_name, code, name, conf, source))
-    
-    return entries
 # ============================================================================
 # UI COMPONENTS
 # ============================================================================
@@ -433,17 +354,8 @@ def render_client_selector():
         if st.button("📂 Load Pricebook", type="primary"):
             load_selected_pricebook(pricebooks, selected_client)
     
-    # Show currently loaded info with last updated time
     if st.session_state.csv_data is not None and st.session_state.selected_client:
-        # Find the selected pricebook to get last updated time
-        selected_pb = next((pb for pb in pricebooks if pb['name'] == st.session_state.selected_client), None)
-        
-        if selected_pb:
-            last_updated_str = selected_pb['last_updated'].strftime("%B %d, %Y at %I:%M %p")
-            st.info(f"📋 Currently loaded: **{st.session_state.selected_client}** ({len(st.session_state.csv_data)} records) | 🕒 Last updated: {last_updated_str}")
-        else:
-            # Fallback for manual uploads
-            st.info(f"📋 Currently loaded: **{st.session_state.selected_client}** ({len(st.session_state.csv_data)} records)")
+        st.info(f"📋 Currently loaded: **{st.session_state.selected_client}** ({len(st.session_state.csv_data)} records)")
 
 def render_no_pricebooks_found():
     """Render fallback UI when no pricebooks are found"""
@@ -472,10 +384,10 @@ def load_selected_pricebook(pricebooks, selected_client):
         st.rerun()
 
 def render_data_input():
-    """Render Step 2: Excel/Text/Image input"""
+    """Render Step 2: Excel/Text input"""
     st.header("Step 2: Add Client Request")
     
-    col1, col2 = st.columns([1, 1])
+    col1, col2 = st.columns(2)
     
     with col1:
         render_excel_upload()
@@ -494,35 +406,12 @@ def render_excel_upload():
         st.success(f"Found {len(entries)} entries")
 
 def render_text_input():
-    """Render text paste and image upload section"""
-    st.subheader("📝 Paste Text/PDF or Upload Image")
-    st.info("💡 For PDFs: Select table → Copy → Paste below | For Images: Upload screenshot/photo")
+    """Render text paste section"""
+    st.subheader("📝 Or Paste Text/PDF")
+    st.info("💡 For PDFs: Select table → Copy → Paste here")
     
-    # Add image upload option
-    image_file = st.file_uploader("Or upload image (PNG, JPG)", type=['png', 'jpg', 'jpeg'], key='image')
-    
-    if image_file and st.button("Extract Text from Image"):
-        try:
-            extracted_text = extract_text_from_image(image_file)
-            st.success("✓ Text extracted from image!")
-            
-            # Show extracted text for review
-            with st.expander("📄 Extracted Text (click to review)"):
-                st.text_area("Extracted content:", value=extracted_text, height=150, disabled=True)
-            
-            # Parse the extracted text
-            entries = parse_text_input(extracted_text, st.session_state.csv_data)
-            st.session_state.parsed_entries = entries
-            if entries:
-                st.success(f"Found {len(entries)} entries from image")
-            else:
-                st.error("No UPCs found in extracted text")
-        except Exception as e:
-            st.error(f"❌ Image processing failed: {str(e)}")
-    
-    # Keep existing text area
     text_input = st.text_area(
-        "Or paste client text/email/copied PDF:",
+        "Paste client text/email/copied PDF:",
         height=200,
         placeholder="Example:\n03202092872 Cookie Monster 2oz\n\nOr paste table from PDF..."
     )
@@ -535,7 +424,6 @@ def render_text_input():
         else:
             st.error("No UPCs found in text")
 
-            
 def render_review_section():
     """Render Step 3: Review and edit parsed entries"""
     st.header("Step 3: Review & Edit Entries")
@@ -637,37 +525,25 @@ def render_entry_editors(display_entries, duplicates):
 
 def add_entries_to_csv(duplicates):
     """Add non-duplicate entries to CSV data"""
-    try:
-        new_entries = [e for e in st.session_state.parsed_entries if e['UPC/ PLU'] not in duplicates]
-        skipped = len(st.session_state.parsed_entries) - len(new_entries)
-        
-        if not new_entries:
-            st.error("All entries are duplicates!")
-            return
-        
+    new_entries = [e for e in st.session_state.parsed_entries if e['UPC/ PLU'] not in duplicates]
+    skipped = len(st.session_state.parsed_entries) - len(new_entries)
+    
+    if new_entries:
         cleaned_entries = []
         for entry in new_entries:
             entry_copy = entry.copy()
-            entry_copy.pop('Confidence', None)  # Remove tracking field
-            entry_copy.pop('Source', None)      # Remove tracking field
+            entry_copy.pop('Confidence', None)
             cleaned_entries.append(entry_copy)
         
         new_df = pd.DataFrame(cleaned_entries)
-        
-        if st.session_state.csv_data is not None:
-            new_df = new_df[st.session_state.csv_data.columns]
-        
         st.session_state.csv_data = pd.concat([st.session_state.csv_data, new_df], ignore_index=True)
         st.session_state.added_entries = cleaned_entries
         st.session_state.parsed_entries = []
         
         st.success(f"✓ Added {len(new_entries)} entries{f', skipped {skipped} duplicates' if skipped > 0 else ''}")
         st.rerun()
-        
-    except Exception as e:
-        st.error(f"❌ Error adding entries: {str(e)}")
-        import traceback
-        st.code(traceback.format_exc())
+    else:
+        st.error("All entries are duplicates!")
 
 def render_recently_added():
     """Show recently added entries"""
@@ -708,31 +584,6 @@ def render_download_section():
     with col2:
         if st.button("📤 Upload to Server", type="secondary"):
             upload_to_server()
-
-def match_against_nacs(product_name):
-    """Match product against NACS keywords"""
-    if not product_name or not NACS_CATEGORIES:
-        return '', '', 0
-    
-    product_upper = product_name.upper()
-    best_match = None
-    best_score = 0
-    
-    for code, info in NACS_CATEGORIES.items():
-        matched_keywords = sum(1 for kw in info['keywords'] if kw.upper() in product_upper)
-        
-        if matched_keywords > 0:
-            score = (matched_keywords / len(info['keywords'])) * 100
-            
-            if score > best_score:
-                best_score = score
-                best_match = (code, info['name'], round(score, 1))
-    
-    if best_match and best_score >= 30:  # Minimum threshold
-        return best_match
-    
-    return '', '', 0
-
 
 def generate_filename(client_name):
     """Generate appropriate filename for download"""
